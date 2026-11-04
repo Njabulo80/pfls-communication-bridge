@@ -1,0 +1,21 @@
+
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "pfls-communication-bridge-v2",
+  "main": "index.js",
+  "compatibility_date": "2026-11-04",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "PFLS_STATE",
+        "class_name": "PFLSState"
+      }
+    ]
+  },
+  "exports": {
+    "PFLSState": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}
