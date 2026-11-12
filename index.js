@@ -1,7 +1,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "0.4";
+const VERSION = "0.5";
 const DASHBOARD_ORIGIN = "https://njabulo80.github.io";
 const HEARTBEAT_TIMEOUT_MS = 90000;
 
@@ -90,14 +90,20 @@ export class PFLSState extends DurableObject {
     }
 
     if (request.method === "GET" && url.pathname === "/read") {
-      const record = await this.ctx.storage.get(
-        "latest_heartbeat"
-      );
-
+      const record = await this.ctx.storage.get("latest_heartbeat");
+      const snapshot = await this.ctx.storage.get("latest_account_snapshot");
       return json({
         found: !!record,
-        heartbeat: record || null
+        heartbeat: record || null,
+        snapshot_found: !!snapshot,
+        snapshot: snapshot || null
       });
+    }
+
+    if (request.method === "POST" && url.pathname === "/save-snapshot") {
+      const snapshot = await request.json();
+      await this.ctx.storage.put("latest_account_snapshot", snapshot);
+      return json({ saved: true });
     }
 
     return json({ error: "Not found" }, 404);
@@ -116,7 +122,8 @@ export default {
       return new Response(null, {
         status: 204,
         headers: {
-          "Access-Control-Allow-Origin": DASHBOARD_ORIGIN,
+          "Access-Control-Allow-Origin":
+            origin === DASHBOARD_ORIGIN || origin === "null" ? origin : DASHBOARD_ORIGIN,
           "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
           "Access-Control-Allow-Headers": "Content-Type, Authorization",
           "Access-Control-Max-Age": "86400"
@@ -152,6 +159,78 @@ export default {
           trading_enabled: false,
           timestamp: new Date().toISOString()
         });
+      }
+    }
+
+    // Authenticated read-only MT5 account snapshot ingestion.
+    if (method === "POST" && path === "/api/mt5/snapshot") {
+      if (!authorized(request, env)) return json({ error: "Unauthorized" }, 401);
+      try {
+        const raw = await request.text();
+        if (raw.length > 64000) return json({ error: "Snapshot too large" }, 413);
+        const body = JSON.parse(raw);
+        if (!body || typeof body !== "object" || Array.isArray(body)) return json({ error: "Invalid snapshot" }, 400);
+        if (body.account_type !== "DEMO") return json({ error: "Demo accounts only" }, 403);
+        if (!Array.isArray(body.open_positions) || !Array.isArray(body.recent_deals)) return json({ error: "Missing account arrays" }, 400);
+
+        const snapshot = {
+          received_at: new Date().toISOString(),
+          collector_version: String(body.collector_version || "unknown").slice(0, 20),
+          account_type: "DEMO",
+          account_login: Number(body.account_login) || 0,
+          account_currency: String(body.account_currency || "").slice(0, 12),
+          account_server: String(body.account_server || "").slice(0, 100),
+          broker_company: String(body.broker_company || "").slice(0, 100),
+          balance: Number(body.balance) || 0,
+          equity: Number(body.equity) || 0,
+          margin: Number(body.margin) || 0,
+          free_margin: Number(body.free_margin) || 0,
+          margin_level: Number(body.margin_level) || 0,
+          floating_profit: Number(body.floating_profit) || 0,
+          terminal_connected: body.terminal_connected === true,
+          symbol: String(body.symbol || "").slice(0, 40),
+          snapshot_time: String(body.snapshot_time || "").slice(0, 40),
+          open_positions: body.open_positions.slice(0, 100),
+          recent_deals: body.recent_deals.slice(-100)
+        };
+        const id = env.PFLS_STATE.idFromName("pfls-main-status");
+        const stub = env.PFLS_STATE.get(id);
+        const saved = await stub.fetch("https://pfls-state/save-snapshot", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(snapshot)
+        });
+        if (!saved.ok) return json({ error: "Snapshot storage failed" }, 500);
+        return json({ accepted: true, stored: true, account_type: "DEMO",
+          positions_count: snapshot.open_positions.length,
+          deals_count: snapshot.recent_deals.length,
+          received_at: snapshot.received_at });
+      } catch (error) {
+        return json({ error: "Invalid snapshot request" }, 400);
+      }
+    }
+
+    // Authenticated mobile read endpoint. This token cannot write account data.
+    if (method === "GET" && path === "/api/mobile/snapshot") {
+      const readToken = env.PFLS_MOBILE_READ_TOKEN || "";
+      const header = request.headers.get("Authorization") || "";
+      const supplied = header.startsWith("Bearer ") ? header.slice(7) : "";
+      if (!readToken || supplied.length !== readToken.length)
+        return json({ error: "Unauthorized" }, 401, origin === "null" ? "null" : DASHBOARD_ORIGIN);
+      let difference = 0;
+      for (let i = 0; i < readToken.length; i++)
+        difference |= readToken.charCodeAt(i) ^ supplied.charCodeAt(i);
+      if (difference !== 0)
+        return json({ error: "Unauthorized" }, 401, origin === "null" ? "null" : DASHBOARD_ORIGIN);
+      try {
+        const id = env.PFLS_STATE.idFromName("pfls-main-status");
+        const stub = env.PFLS_STATE.get(id);
+        const result = await stub.fetch("https://pfls-state/read");
+        const data = await result.json();
+        return json({ found: !!data.snapshot_found, snapshot: data.snapshot || null,
+          timestamp: new Date().toISOString() }, 200, origin === "null" ? "null" : DASHBOARD_ORIGIN);
+      } catch (error) {
+        return json({ error: "Snapshot unavailable" }, 500, origin === "null" ? "null" : DASHBOARD_ORIGIN);
       }
     }
 
